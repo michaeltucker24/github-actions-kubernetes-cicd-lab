@@ -1,14 +1,16 @@
 # Troubleshooting Notes
 
-This file documents common issues encountered or expected while building the GitHub Actions Kubernetes CI/CD pipeline lab.
+This file documents the main issues encountered while building the GitHub Actions Kubernetes CI/CD pipeline lab.
 
-## Issue 1: GitHub Actions Workflow Fails Because Secrets Are Missing
+---
+
+## Issue 1: GitHub Actions Workflow Failed Because Secrets Were Missing
 
 **Problem:**  
-The workflow fails during Docker Hub login or Kubernetes configuration.
+The GitHub Actions workflow could not complete because the required repository secrets were not configured yet.
 
 **Likely Cause:**  
-Required GitHub Actions secrets have not been created yet.
+The workflow depended on Docker Hub and Kubernetes authentication secrets.
 
 **Required Secrets:**
 
@@ -19,92 +21,239 @@ KUBE_CONFIG
 ```
 
 **Fix:**  
-Add the required secrets in the GitHub repository under:
+The required secrets were added in GitHub under:
 
 ```text
 Settings > Secrets and variables > Actions > New repository secret
 ```
 
-## Issue 2: Docker Image Does Not Pull in Kubernetes
+---
+
+## Issue 2: Kubernetes Pods Showed ImagePullBackOff
 
 **Problem:**  
-The Kubernetes pod fails with an image pull error.
-
-**Likely Cause:**  
-The image name in `k8s/deployment.yaml` does not match the image pushed by GitHub Actions.
-
-**Fix:**  
-Confirm the image name is consistent in both places:
-
-```yaml
-image: michaeltucker24/cicd-demo-app:latest
-```
-
-and:
-
-```yaml
-tags: ${{ secrets.DOCKERHUB_USERNAME }}/cicd-demo-app:latest
-```
-
-## Issue 3: Kubernetes Rollout Does Not Complete
-
-**Problem:**  
-The workflow hangs or fails during:
-
-```bash
-kubectl rollout status deployment/cicd-demo-app
-```
-
-**Likely Cause:**  
-The pod is not becoming ready, the image cannot be pulled, or the deployment has a manifest issue.
-
-**Fix:**
-
-```bash
-kubectl get pods
-kubectl describe pod <pod-name>
-kubectl logs <pod-name>
-```
-
-## Issue 4: Application Is Not Reachable in Browser
-
-**Problem:**  
-The pod is running, but the app cannot be reached from the browser.
-
-**Likely Cause:**  
-The AWS security group may not allow inbound traffic on the NodePort.
-
-**Fix:**  
-Allow inbound TCP traffic on:
+After the Kubernetes manifests were applied manually, the pods did not start successfully and showed:
 
 ```text
-30080
+ImagePullBackOff
 ```
 
-Then test:
+**Cause:**  
+The Kubernetes Deployment referenced this image:
 
 ```text
-http://<EC2-PUBLIC-IP>:30080
+michaeltucker24/cicd-demo-app:latest
 ```
 
-## Issue 5: Kubeconfig Secret Fails to Decode
-
-**Problem:**  
-The workflow fails during Kubernetes access configuration.
-
-**Likely Cause:**  
-The `KUBE_CONFIG` secret was not base64 encoded correctly.
+but the image had not been pushed to Docker Hub yet.
 
 **Fix:**  
-Regenerate the kubeconfig secret value from the EC2 server and add it again to GitHub Actions secrets.
+The Docker image was built and pushed to Docker Hub:
+
+```bash
+docker build -t michaeltucker24/cicd-demo-app:latest .
+docker push michaeltucker24/cicd-demo-app:latest
+```
+
+---
+
+## Issue 3: Pods Failed With exec format error
+
+**Problem:**  
+After the Docker image was pushed, Kubernetes was able to pull the image, but the containers failed to start.
+
+The pod logs showed:
+
+```text
+exec format error
+```
+
+**Cause:**  
+The image was built on a Mac and pushed with the wrong CPU architecture for the AWS EC2 Kubernetes node.
+
+**Fix:**  
+The image was rebuilt for the EC2 server architecture:
+
+```bash
+docker buildx build --platform linux/amd64 -t michaeltucker24/cicd-demo-app:latest --push .
+```
+
+The GitHub Actions workflow was also updated with:
+
+```yaml
+platforms: linux/amd64
+```
+
+---
+
+## Issue 4: kubectl Permission Denied on EC2
+
+**Problem:**  
+Running `kubectl` directly on the EC2 server caused a permission error.
+
+**Cause:**  
+The K3s kubeconfig file is owned by root.
+
+**Fix:**  
+Commands on the EC2 server were run with `sudo`:
+
+```bash
+sudo kubectl get pods
+sudo kubectl get services
+sudo kubectl rollout status deployment/cicd-demo-app
+```
+
+---
+
+## Issue 5: Incorrect scp Destination
+
+**Problem:**  
+The Kubernetes manifest folder did not appear on the EC2 server after copying it.
+
+**Cause:**  
+The `scp` command was missing the remote destination path.
+
+Incorrect example:
+
+```bash
+scp -i ~/Downloads/k3s-cicd-demo-key.pem -r k8s ubuntu@54.151.242.84
+```
+
+**Fix:**  
+The command was corrected by adding the destination path:
+
+```bash
+scp -i ~/Downloads/k3s-cicd-demo-key.pem -r k8s ubuntu@54.151.242.84:~/
+```
+
+The `:~/` tells `scp` to copy the folder into the Ubuntu user's home directory on the EC2 server.
+
+---
+
+## Issue 6: GitHub Actions Tried to Connect to 127.0.0.1
+
+**Problem:**  
+The workflow failed when trying to deploy to Kubernetes.
+
+The error showed GitHub Actions attempting to connect to:
+
+```text
+https://127.0.0.1:6443
+```
+
+**Cause:**  
+The kubeconfig file generated by K3s was designed for use from inside the EC2 server.
+
+GitHub Actions runs outside the EC2 server, so `127.0.0.1` pointed back to the GitHub Actions runner instead of the K3s server.
+
+**Fix:**  
+A corrected kubeconfig value was generated by replacing local/private addresses with the EC2 public IP and storing it as the `KUBE_CONFIG` GitHub Actions secret.
+
+```bash
+ssh -i ~/Downloads/k3s-cicd-demo-key.pem ubuntu@54.151.242.84 "sudo cat /etc/rancher/k3s/k3s.yaml | sed 's/127.0.0.1/54.151.242.84/g' | sed 's/172.31.43.216/54.151.242.84/g' | base64 -w 0" | pbcopy
+```
+
+---
+
+## Issue 7: base64 invalid input
+
+**Problem:**  
+The workflow failed while decoding the `KUBE_CONFIG` secret.
+
+The error was:
+
+```text
+base64: invalid input
+```
+
+**Cause:**  
+The secret value was copied incorrectly. The terminal prompt or extra characters may have been included.
+
+**Fix:**  
+The kubeconfig was regenerated and copied directly to the Mac clipboard using `pbcopy`:
+
+```bash
+ssh -i ~/Downloads/k3s-cicd-demo-key.pem ubuntu@54.151.242.84 "sudo cat /etc/rancher/k3s/k3s.yaml | sed 's/127.0.0.1/54.151.242.84/g' | sed 's/172.31.43.216/54.151.242.84/g' | base64 -w 0" | pbcopy
+```
+
+The corrected value was pasted into the GitHub `KUBE_CONFIG` secret.
+
+---
+
+## Issue 8: K3s TLS Certificate Did Not Include Public IP
+
+**Problem:**  
+GitHub Actions was able to reach the Kubernetes API server, but the workflow failed with a TLS certificate error.
+
+The error stated that the certificate was valid for internal addresses, but not the EC2 public IP.
+
+**Cause:**  
+K3s generated its Kubernetes API certificate with internal addresses only.
+
+The public IP was not included as a TLS Subject Alternative Name.
+
+**Fix:**  
+A K3s config file was created on the EC2 server:
+
+```bash
+sudo mkdir -p /etc/rancher/k3s
+
+sudo tee /etc/rancher/k3s/config.yaml > /dev/null <<EOF
+tls-san:
+  - 54.151.242.84
+EOF
+```
+
+K3s was restarted:
+
+```bash
+sudo systemctl restart k3s
+```
+
+After this, the `KUBE_CONFIG` secret was regenerated and the workflow was re-run successfully.
+
+---
+
+## Issue 9: AWS Security Group Needed Kubernetes API Access
+
+**Problem:**  
+GitHub Actions needed to connect to the K3s Kubernetes API server on the EC2 instance.
+
+**Cause:**  
+The Kubernetes API runs on TCP port:
+
+```text
+6443
+```
+
+If this port is blocked by the AWS security group, GitHub Actions cannot deploy to the cluster.
+
+**Fix:**  
+For lab purposes, inbound access to TCP `6443` was temporarily allowed so GitHub Actions could reach the Kubernetes API.
+
+After the project is fully documented, the EC2 instance and related security group should be deleted or locked down.
+
+---
 
 ## Lessons Learned
 
-This project demonstrates the importance of validating each layer of a CI/CD deployment separately:
+This project showed that CI/CD troubleshooting often requires validating each layer separately:
 
-1. Confirm the app works locally.
+1. Confirm the application runs locally.
 2. Confirm the Docker image builds.
-3. Confirm Kubernetes manifests work manually.
-4. Confirm registry authentication works.
-5. Confirm GitHub Actions can connect to Kubernetes.
-6. Confirm the rollout succeeds after automation.
+3. Confirm the Docker image is pushed to the correct registry namespace.
+4. Confirm Kubernetes can pull and run the image.
+5. Confirm the image architecture matches the target server.
+6. Confirm the Kubernetes manifests work manually.
+7. Confirm GitHub Actions secrets are correctly configured.
+8. Confirm GitHub Actions can reach the Kubernetes API.
+9. Confirm TLS certificates match the address used by the kubeconfig.
+10. Confirm the automated rollout succeeds.
+
+---
+
+## Final Result
+
+After troubleshooting the image pull issue, architecture mismatch, kubeconfig address issue, base64 secret issue, and K3s TLS certificate issue, the GitHub Actions workflow completed successfully.
+
+The final pipeline successfully builds the Docker image, pushes it to Docker Hub, deploys the app to Kubernetes, and verifies the rollout.
